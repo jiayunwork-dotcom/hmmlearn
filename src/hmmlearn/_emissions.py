@@ -7,6 +7,7 @@ from scipy import special
 from scipy.stats import multinomial, poisson
 from sklearn.utils import check_random_state
 
+from . import _missing
 from .base import BaseHMM, _AbstractHMM
 from .stats import log_multivariate_normal_density
 from .utils import fill_covars, log_normalize
@@ -126,7 +127,38 @@ class BaseGaussianHMM(_AbstractHMM):
             }[self.covariance_type],
         }
 
+    @property
+    def _allows_missing(self):
+        # The ``missing`` option is specific to GaussianHMM; other Gaussian
+        # estimators (e.g. VariationalGaussianHMM) keep the strict checks.
+        return getattr(self, "missing", "raise") == "marginalize"
+
+    def _get_missing_cache(self):
+        """Lazily create the pattern cache used for marginalized inference."""
+        cache = getattr(self, "_missing_cache_", None)
+        if cache is None:
+            cache = _missing.MissingCache()
+            self._missing_cache_ = cache
+        return cache
+
+    def _invalidate_missing_cache(self):
+        """Drop cached factors when covariance parameters change."""
+        cache = getattr(self, "_missing_cache_", None)
+        if cache is not None:
+            cache.bump()
+
+    def _reset_missing_cache(self):
+        """Forget all retained patterns, e.g. at the start of a new fit."""
+        cache = getattr(self, "_missing_cache_", None)
+        if cache is not None:
+            cache.clear()
+
     def _compute_log_likelihood(self, X):
+        if self._allows_missing and np.isnan(X).any():
+            cache = self._get_missing_cache()
+            return _missing.log_gaussian_likelihood_missing(
+                X, self.means_, self._covars_, self.covariance_type,
+                cache=cache, stamp=cache.stamp)
         return log_multivariate_normal_density(
             X, self.means_, self._covars_, self.covariance_type)
 
@@ -134,6 +166,7 @@ class BaseGaussianHMM(_AbstractHMM):
         stats = super()._initialize_sufficient_statistics()
         stats['post'] = np.zeros(self.n_components)
         stats['obs'] = np.zeros((self.n_components, self.n_features))
+        stats['obs_count'] = np.zeros((self.n_components, self.n_features))
         stats['obs**2'] = np.zeros((self.n_components, self.n_features))
         if self.covariance_type in ('tied', 'full'):
             stats['obs*obs.T'] = np.zeros((self.n_components, self.n_features,
@@ -142,15 +175,24 @@ class BaseGaussianHMM(_AbstractHMM):
 
     def _accumulate_sufficient_statistics(
             self, stats, X, lattice, posteriors, fwdlattice, bwdlattice):
+        # Base accumulation handles 'nobs', 'start' and 'trans' for every
+        # implementation; emission-specific statistics are added below.
         super()._accumulate_sufficient_statistics(stats=stats, X=X,
                                                   lattice=lattice,
                                                   posteriors=posteriors,
                                                   fwdlattice=fwdlattice,
                                                   bwdlattice=bwdlattice)
 
+        if self._allows_missing and np.isnan(X).any():
+            self._accumulate_missing_sufficient_statistics(
+                stats, X, posteriors)
+            return
+
         if self._needs_sufficient_statistics_for_mean():
             stats['post'] += posteriors.sum(axis=0)
             stats['obs'] += posteriors.T @ X
+            # With complete data every channel sees every frame.
+            stats['obs_count'] += posteriors.sum(axis=0)[:, None]
 
         if self._needs_sufficient_statistics_for_covars():
             if self.covariance_type in ('spherical', 'diag'):
@@ -160,6 +202,47 @@ class BaseGaussianHMM(_AbstractHMM):
                 # -> (nc, nf, nf)
                 stats['obs*obs.T'] += np.einsum(
                     'ij,ik,il->jkl', posteriors, X, X)
+
+    def _accumulate_missing_sufficient_statistics(
+            self, stats, X, posteriors):
+        """
+        E-step with missing observations.
+
+        Missing cells contribute their Gaussian conditional moments, so the
+        statistics always refer to the *observed-data* likelihood: a gap is
+        never counted as if it were a measured value.
+        """
+        need_mean = self._needs_sufficient_statistics_for_mean()
+        need_covars = self._needs_sufficient_statistics_for_covars()
+        if not (need_mean or need_covars):
+            return
+
+        full = self.covariance_type == "full"
+        filled, second_moment, cond_var = _missing.conditional_moments(
+            X, self.means_, self._covars_, self.covariance_type,
+            need_second_moment=full and need_covars,
+            need_variance=(not full) and need_covars)
+
+        if need_mean:
+            # E[sum_t gamma_tc X_tf] with missing cells replaced by their
+            # conditional means.
+            stats['obs'] += np.einsum('tc,tcf->cf', posteriors, filled)
+            observed = (~np.isnan(X)).astype(float)
+            stats['obs_count'] += posteriors.T @ observed
+            stats['post'] += posteriors.sum(axis=0)
+
+        if need_covars:
+            if full:
+                stats['obs*obs.T'] += np.einsum(
+                    'tc,tcfk->cfk', posteriors, second_moment)
+            else:
+                # E[X_f^2 | obs] = E[X_f | obs]^2 + Var[X_f | obs]; the
+                # conditional variance is zero on observed cells.
+                second = filled * filled
+                if cond_var is not None:
+                    second = second + cond_var
+                stats['obs**2'] += np.einsum(
+                    'tc,tcf->cf', posteriors, second)
 
     def _needs_sufficient_statistics_for_mean(self):
         """

@@ -5,6 +5,22 @@ import warnings
 import numpy as np
 
 
+def check_array(X, allow_nan=False):
+    """``sklearn.utils.check_array`` wrapper tolerating its keyword rename.
+
+    ``force_all_finite`` was renamed to ``ensure_all_finite`` in
+    scikit-learn 1.6.  NaN is only accepted when *allow_nan* is true;
+    ``+/- inf`` is rejected in either case.
+    """
+    from sklearn.utils import check_array as sklearn_check_array
+    try:
+        return sklearn_check_array(
+            X, ensure_all_finite="allow-nan" if allow_nan else True)
+    except TypeError:  # scikit-learn < 1.6
+        return sklearn_check_array(
+            X, force_all_finite="allow-nan" if allow_nan else True)
+
+
 def logdet(a):
     sign, logdet = np.linalg.slogdet(a)
     if (sign < 0).any():

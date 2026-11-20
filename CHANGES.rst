@@ -3,6 +3,19 @@ hmmlearn Changelog
 
 Here you can see the full list of changes between each hmmlearn release.
 
+Unreleased
+----------
+
+- Add a ``missing`` option to ``GaussianHMM``.  ``missing="marginalize"``
+  treats NaN entries as unobserved channels: they are integrated out of the
+  Gaussian emission probability for scoring and decoding, and their
+  conditional Gaussian moments enter the EM statistics during ``fit``, so
+  gaps are never used as imputed measurements.  Fully missing rows keep
+  their time step and connect the transitions on both sides.  Only
+  ``covariance_type="diag"`` and ``"full"`` are supported; infinity remains
+  an illegal input and the other estimators keep requiring finite inputs.
+  The default ``missing="raise"`` preserves the previous behavior.
+
 Version 0.3.3
 ~~~~~~~~~~~~~
 

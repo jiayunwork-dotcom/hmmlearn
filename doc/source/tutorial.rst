@@ -206,6 +206,86 @@ Finally, just call the desired method with ``X`` and ``lengths``:
 >>> hmm.GaussianHMM(n_components=3).fit(X, lengths)
 GaussianHMM(...
 
+.. _missing_observations:
+
+Working with missing observations
+---------------------------------
+
+Sensor channels do not always report a reading at every time step.
+:class:`~hmmlearn.hmm.GaussianHMM` can model such gaps directly with
+``missing="marginalize"`` instead of forcing you to zero-fill or delete the
+affected rows:
+
+>>> model = hmm.GaussianHMM(
+...     n_components=3, covariance_type="full", missing="marginalize")
+
+A ``NaN`` entry means that the corresponding channel was *not observed* at
+that time step; the missing channel is integrated (marginalized) out of the
+Gaussian emission probability.  Several rules follow from this definition:
+
+* A row that is missing some channels is scored from the remaining channels
+  only.  With ``covariance_type="full"`` the correlations between observed
+  and missing channels stay effective, because the marginal density is the
+  Gaussian restricted to the observed sub-vector.  With
+  ``covariance_type="diag"`` channels are independent, so each observed
+  channel simply contributes its own factor.
+* A row that is missing *every* channel carries no emission evidence
+  (its emission log-probability is zero for every state), but it still
+  occupies a time step: the forward-backward recursion and the Viterbi
+  algorithm propagate through it using the transition matrix, so the states
+  before and after the gap remain connected.  Rows are never removed from
+  the sequence, and ``lengths`` boundaries are respected as usual.
+* During :meth:`~.BaseHMM.fit` the same convention is used in every EM
+  iteration.  Missing cells are never treated as measured zeros: their
+  Gaussian conditional mean and conditional covariance (given the observed
+  channels) enter the sufficient statistics, so the parameter updates
+  maximize the *observed-data* likelihood.  Start probabilities and
+  transition probabilities are learned as before, and parameters omitted
+  from ``params`` remain frozen.
+* Every public entry point -- :meth:`~.BaseHMM.score`,
+  :meth:`~.BaseHMM.score_samples`, :meth:`~.BaseHMM.predict_proba`,
+  :meth:`~.BaseHMM.predict` and :meth:`~.BaseHMM.decode` with either the
+  ``"viterbi"`` or ``"map"`` algorithm -- accepts the same NaN-containing
+  array, and the ``"log"`` and ``"scaling"`` implementations give the same
+  inferred probabilities up to floating-point error.
+
+Inputs without any NaN produce numerically identical results under
+``missing="raise"`` (the default) and ``missing="marginalize"``.
+
+Rejected inputs
+~~~~~~~~~~~~~~~
+
+* ``missing="marginalize"`` is only available for
+  ``covariance_type="diag"`` and ``covariance_type="full"``;
+  ``"spherical"`` and ``"tied"`` raise a ``ValueError``.
+* Positive or negative infinity is always illegal, in either mode -- only
+  ``NaN`` is interpreted as "not observed".
+* The option is specific to :class:`~hmmlearn.hmm.GaussianHMM`.  The other
+  estimators (including :class:`~hmmlearn.vhmm.VariationalGaussianHMM`)
+  continue to require fully finite inputs.
+* Automatic initialization needs at least one finite reading of every
+  channel in the whole batch.  If a channel is missing everywhere and the
+  model is asked to initialize the Gaussian parameters, a ``ValueError``
+  explains the offending feature.  You can still run inference (or fit with
+  the Gaussian parameters frozen via ``init_params``/``params``) on such
+  data when ``means_`` and ``covars_`` are provided explicitly -- even a
+  batch containing no finite readings at all.
+
+Implementation notes
+~~~~~~~~~~~~~~~~~~~~
+
+Rows sharing the same observed-channel mask form a *missingness pattern*
+group; the per-state Cholesky factors, log-determinants and conditional
+moments for a pattern are computed once and reused for every row in the
+group.  Factors depending only on the covariances are cached on the model
+between calls and invalidated automatically whenever the covariance
+parameters change or a new fit starts.  The auxiliary cache is capped at
+64 MiB (patterns that would exceed the budget are recomputed on demand),
+channel subsets are never expanded exhaustively, and the cache excludes the
+input, the model parameters and the standard per-time-step inference
+arrays.  See ``scripts/benchmark_missing.py`` for runtime and memory
+measurements on cyclic and row-specific missingness regimes.
+
 Saving and loading HMM
 ----------------------
 

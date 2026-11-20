@@ -9,7 +9,7 @@ from scipy import linalg
 from sklearn import cluster
 from sklearn.utils import check_random_state
 
-from . import _emissions, _utils
+from . import _emissions, _missing, _utils
 from .base import BaseHMM
 from .utils import fill_covars, normalize
 
@@ -201,7 +201,7 @@ class GaussianHMM(_emissions.BaseGaussianHMM, BaseHMM):
                  algorithm="viterbi", random_state=None,
                  n_iter=10, tol=1e-2, verbose=False,
                  params="stmc", init_params="stmc",
-                 implementation="log"):
+                 implementation="log", missing="raise"):
         """
         Parameters
         ----------
@@ -276,6 +276,25 @@ class GaussianHMM(_emissions.BaseGaussianHMM, BaseHMM):
             Determines if the forward-backward algorithm is implemented with
             logarithms ("log"), or using scaling ("scaling").  The default is
             to use logarithms for backwards compatability.
+
+        missing : {"raise", "marginalize"}, optional
+            How to handle observations containing NaN.
+
+            - "raise" (default): inputs must be finite, as in previous
+              versions; any NaN (or infinity) raises an error.
+            - "marginalize": NaN marks a channel that was not observed at
+              that time step.  The missing channel is integrated out of the
+              Gaussian emission probability: rows with some missing channels
+              are scored from the remaining channels (channel correlations
+              remain effective with ``covariance_type="full"``), and rows
+              that are entirely missing carry no emission evidence while
+              still occupying a time step and linking the transitions on
+              both sides.  During :meth:`fit` the uncertainty of missing
+              cells enters the Gaussian parameter updates through their
+              conditional Gaussian moments, instead of being treated as a
+              measured value.  Only "diag" and "full" covariance types are
+              supported; infinity is always rejected.  This option is
+              specific to :class:`GaussianHMM`.
         """
         super().__init__(n_components,
                          startprob_prior=startprob_prior,
@@ -290,6 +309,16 @@ class GaussianHMM(_emissions.BaseGaussianHMM, BaseHMM):
         self.means_weight = means_weight
         self.covars_prior = covars_prior
         self.covars_weight = covars_weight
+        if missing not in ("raise", "marginalize"):
+            raise ValueError(
+                "missing must be one of 'raise' or 'marginalize', "
+                f"got {missing!r}")
+        if missing == "marginalize" and covariance_type not in ("diag", "full"):
+            raise ValueError(
+                "missing='marginalize' is only supported with "
+                "covariance_type 'diag' or 'full', got "
+                f"{covariance_type!r}")
+        self.missing = missing
 
     @property
     def covars_(self):
@@ -303,10 +332,24 @@ class GaussianHMM(_emissions.BaseGaussianHMM, BaseHMM):
         _utils._validate_covars(covars, self.covariance_type,
                                 self.n_components)
         self._covars_ = covars
+        self._invalidate_missing_cache()
+
+    def _check_array(self, X):
+        # NaN denotes a missing channel and is only legal in marginalize
+        # mode; +/- infinity is illegal under every setting.
+        return _utils.check_array(
+            X, allow_nan=self.missing == "marginalize")
 
     def _init(self, X, lengths=None):
-        super()._init(X, lengths)
+        if self.missing == "marginalize" and np.isnan(X).any():
+            self._init_with_missing(X, lengths)
+            return
+        # BaseHMM initialization (n_features, startprob, transmat, the
+        # data-size warning); BaseGaussianHMM has no _init of its own.
+        BaseHMM._init(self, X, lengths)
+        self._init_gaussian(X)
 
+    def _init_gaussian(self, X):
         if self._needs_init("m", "means_"):
             kmeans = cluster.KMeans(n_clusters=self.n_components,
                                     random_state=self.random_state,
@@ -315,6 +358,51 @@ class GaussianHMM(_emissions.BaseGaussianHMM, BaseHMM):
             self.means_ = kmeans.cluster_centers_
         if self._needs_init("c", "covars_"):
             cv = np.cov(X.T) + self.min_covar * np.eye(X.shape[1])
+            if not cv.shape:
+                cv.shape = (1, 1)
+            self.covars_ = \
+                _utils.distribute_covar_matrix_to_match_covariance_type(
+                    cv, self.covariance_type, self.n_components).copy()
+
+    def _init_with_missing(self, X, lengths):
+        # Base initialization (n_features, startprob, transmat, data-size
+        # warning) operates on the raw, possibly NaN-containing array.
+        BaseHMM._init(self, X, lengths)
+
+        finite = np.isfinite(X)
+        unobserved = np.flatnonzero(~finite.any(axis=0))
+        if unobserved.size and (
+                self._needs_init("m", "means_")
+                or self._needs_init("c", "covars_")):
+            raise ValueError(
+                "Cannot initialize Gaussian emission parameters: feature(s) "
+                f"{unobserved.tolist()} have no finite observation in the "
+                "whole batch.  Either provide means_/covars_ explicitly "
+                "(and drop the corresponding letters from init_params) or "
+                "remove these channels from the input.")
+
+        if not (self._needs_init("m", "means_")
+                or self._needs_init("c", "covars_")):
+            return
+
+        # Temporary initialization estimate only: mean-impute the gaps with
+        # the per-channel observed mean so that standard routines can run.
+        # Imputed values never enter the EM statistics; the formal training
+        # target stays the observed-data likelihood.
+        col_mean = np.nanmean(X, axis=0)
+        X_imputed = np.where(np.isnan(X), np.broadcast_to(col_mean, X.shape),
+                             X)
+        row_weight = (~np.isnan(X)).astype(float).sum(axis=1)
+
+        if self._needs_init("m", "means_"):
+            kmeans = cluster.KMeans(n_clusters=self.n_components,
+                                    random_state=self.random_state,
+                                    n_init=10)  # sklearn <1.4 backcompat.
+            kmeans.fit(X_imputed, sample_weight=row_weight)
+            self.means_ = kmeans.cluster_centers_
+        if self._needs_init("c", "covars_"):
+            cv = np.diag(np.nanvar(X, axis=0)) \
+                + self.min_covar * np.eye(X.shape[1])
             if not cv.shape:
                 cv.shape = (1, 1)
             self.covars_ = \
@@ -330,6 +418,17 @@ class GaussianHMM(_emissions.BaseGaussianHMM, BaseHMM):
         if self.covariance_type not in COVARIANCE_TYPES:
             raise ValueError(
                 f"covariance_type must be one of {COVARIANCE_TYPES}")
+        if self.missing == "marginalize" and \
+                self.covariance_type not in ("diag", "full"):
+            raise ValueError(
+                "missing='marginalize' is only supported with "
+                "covariance_type 'diag' or 'full'")
+
+    def _estep_begin(self):
+        # A fit iteration reuses the same covars across all sequences (and
+        # between likelihood evaluation and moment accumulation); start
+        # each E-step with a fresh pattern generation.
+        self._reset_missing_cache()
 
     def _needs_sufficient_statistics_for_mean(self):
         return 'm' in self.params
@@ -343,14 +442,24 @@ class GaussianHMM(_emissions.BaseGaussianHMM, BaseHMM):
         means_prior = self.means_prior
         means_weight = self.means_weight
 
-        # TODO: find a proper reference for estimates for different
-        #       covariance models.
-        # Based on Huang, Acero, Hon, "Spoken Language Processing",
-        # p. 443 - 445
-        denom = stats['post'][:, None]
         if 'm' in self.params:
-            self.means_ = ((means_weight * means_prior + stats['obs'])
+            if self.missing == "marginalize":
+                # Missing cells carry their conditional mean, so every
+                # frame contributes to every channel; the denominator is
+                # the total posterior mass as in the complete-data case.
+                # ``obs_count`` only guards channels with no observed cell
+                # at all, whose means are left untouched.
+                denom = stats['post'][:, None]
+                updated = ((means_weight * means_prior + stats['obs'])
                            / (means_weight + denom))
+                unobserved = stats['obs_count'] == 0
+                if unobserved.any():
+                    updated = np.where(unobserved, self.means_, updated)
+                self.means_ = updated
+            else:
+                denom = stats['post'][:, None]
+                self.means_ = ((means_weight * means_prior + stats['obs'])
+                               / (means_weight + denom))
 
         if 'c' in self.params:
             covars_prior = self.covars_prior
@@ -361,9 +470,12 @@ class GaussianHMM(_emissions.BaseGaussianHMM, BaseHMM):
                 c_n = (means_weight * meandiff**2
                        + stats['obs**2']
                        - 2 * self.means_ * stats['obs']
-                       + self.means_**2 * denom)
-                c_d = max(covars_weight - 1, 0) + denom
+                       + self.means_**2 * stats['post'][:, None])
+                c_d = max(covars_weight - 1, 0) + stats['post'][:, None]
                 self._covars_ = (covars_prior + c_n) / np.maximum(c_d, 1e-5)
+                if self.missing == "marginalize":
+                    np.maximum(self._covars_, self.min_covar,
+                               out=self._covars_)
                 if self.covariance_type == 'spherical':
                     self._covars_ = np.tile(self._covars_.mean(1)[:, None],
                                             (1, self._covars_.shape[1]))
@@ -385,6 +497,15 @@ class GaussianHMM(_emissions.BaseGaussianHMM, BaseHMM):
                 elif self.covariance_type == 'full':
                     self._covars_ = ((covars_prior + c_n) /
                                      (cvweight + stats['post'][:, None, None]))
+                    if self.missing == "marginalize":
+                        # Guard against floating-point PSD violations in
+                        # states with negligible posterior mass.
+                        self._covars_ = _missing.regularize_full_covars(
+                            self._covars_, self.min_covar)
+        if self.missing == "marginalize":
+            # Covariance factors cached for scoring must not survive a
+            # parameter update.
+            self._invalidate_missing_cache()
 
 
 class GMMHMM(_emissions.BaseGMMHMM):

@@ -6,8 +6,7 @@ from collections import deque
 import numpy as np
 from scipy import linalg, special
 from sklearn.base import BaseEstimator
-from sklearn.utils.validation import (
-    check_array, check_is_fitted, check_random_state)
+from sklearn.utils.validation import check_is_fitted, check_random_state
 
 from . import _hmmc, _kl_divergence as _kl, _utils
 from .utils import normalize, log_normalize
@@ -231,6 +230,14 @@ class _AbstractHMM(BaseEstimator):
         """
         return self._score(X, lengths, compute_posteriors=False)[0]
 
+    def _check_array(self, X):
+        """Validate and convert the input feature matrix.
+
+        Subclasses may override this to relax the finite-value check, e.g.
+        to allow missing values represented by NaN.
+        """
+        return _utils.check_array(X, allow_nan=False)
+
     def _score(self, X, lengths=None, *, compute_posteriors):
         """
         Helper for `score` and `score_samples`.
@@ -242,7 +249,7 @@ class _AbstractHMM(BaseEstimator):
         check_is_fitted(self, "startprob_")
         self._check()
 
-        X = check_array(X)
+        X = self._check_array(X)
         impl = {
             "scaling": self._score_scaling,
             "log": self._score_log,
@@ -344,7 +351,7 @@ class _AbstractHMM(BaseEstimator):
             "map": self._decode_map
         }[algorithm]
 
-        X = check_array(X)
+        X = self._check_array(X)
         log_prob = 0
         sub_state_sequences = []
         for sub_X in _utils.split_X_lengths(X, lengths):
@@ -472,7 +479,7 @@ class _AbstractHMM(BaseEstimator):
         self : object
             Returns self.
         """
-        X = check_array(X)
+        X = self._check_array(X)
 
         if lengths is None:
             lengths = np.asarray([X.shape[0]])
